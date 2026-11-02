@@ -14,12 +14,12 @@ CLUSTER_COLUMNS = [
     "rank",
     "taxon",
     "cluster_id",
-    "n_units",
-    "cluster_reads",
-    "area",
-    "area_unit",
-    "equivalent_diameter",
-    "diameter_unit",
+    "n_centres",
+    "n_member_units",
+    "member_reads",
+    "member_area",
+    "member_area_unit",
+    "n_shared_members",
     "centroid_x",
     "centroid_y",
     "peak_residual",
@@ -84,12 +84,18 @@ def localize_hotspots(
     local_alpha: float = 0.05,
     min_neighborhood_reads: int = 3,
     min_cluster_units: int = 2,
+    member_z: float = 1.96,
 ) -> pd.DataFrame:
     """Summarise neighborhoods passing within-taxon bootstrap maximum adjustment.
 
-    Components describe enriched-neighborhood centers, not colony boundaries.
-    Small components are retained and marked unsupported. The old residual
-    cutoff remains a deprecated compatibility mode when local_p is absent.
+    Components are connected candidate centres. Their member units are the
+    units inside the components' neighbourhood sets whose own standardized
+    residual is at least ``member_z``; size and support are counted in member
+    units, not centres. A member falling in several components is assigned to
+    the component with the smallest minimum local p (then larger peak
+    neighbourhood reads, then lower component index). Members are units
+    carrying excess counts, not colony boundaries. The old residual cutoff
+    remains a deprecated compatibility mode when local_p is absent.
     """
     y = np.asarray(counts, dtype=float).ravel()
     r = np.asarray(residual, dtype=float).ravel()
@@ -102,6 +108,8 @@ def localize_hotspots(
         raise ValueError("Positive unit_area requires an explicit coordinate_unit.")
     if not 0 < local_alpha < 1 or min_neighborhood_reads < 1 or min_cluster_units < 1:
         raise ValueError("Local alpha/support settings are invalid.")
+    if not np.isfinite(member_z) or member_z <= 0:
+        raise ValueError("member_z must be positive and finite.")
 
     if local_p is None:
         warnings.warn("Legacy residual-threshold localization is descriptive and uncalibrated.",
@@ -126,41 +134,62 @@ def localize_hotspots(
     subgraph = W[active][:, active]
     n_components, labels = connected_components(subgraph, directed=False)
     active_positions = np.flatnonzero(active)
+    legacy = method == "legacy_residual_threshold"
+    centres = [active_positions[labels == k] for k in range(n_components)]
+
+    # Spot-level membership (bootstrap mode). Legacy mode: active units are members.
+    if legacy:
+        members = centres
+        shared = [0] * n_components
+    else:
+        A = neighborhood_operator(W)
+        excess = np.isfinite(r) & (r >= member_z)
+        candidate = []
+        for positions in centres:
+            region = np.flatnonzero(np.asarray(A[positions].sum(axis=0)).ravel() > 0)
+            candidate.append(region[excess[region]])
+        priority = [(float(np.min(local_p[c])), -float(np.max(neighborhood_reads[c])), k)
+                    for k, c in enumerate(centres)]
+        owner: dict[int, int] = {}
+        claims: dict[int, int] = {}
+        for k, units in enumerate(candidate):
+            for unit in units.tolist():
+                claims[unit] = claims.get(unit, 0) + 1
+                if unit not in owner or priority[k] < priority[owner[unit]]:
+                    owner[unit] = k
+        members = [np.array(sorted(u for u, k in owner.items() if k == comp), dtype=int)
+                   for comp in range(n_components)]
+        shared = [int(sum(claims[u] > 1 for u in m.tolist())) for m in members]
+
     rows = []
     for component in range(n_components):
-        positions = active_positions[labels == component]
-        if not len(positions):
-            continue
+        positions, member = centres[component], members[component]
+        located = member if len(member) else positions
         if unit_area is not None:
-            area = float(len(positions) * unit_area)
-            area_unit = f"{coordinate_unit or 'coordinate'}^2"
-            diameter = float(np.sqrt(4.0 * area / np.pi))
-            diameter_unit = coordinate_unit or "coordinate"
+            member_area = float(len(member) * unit_area)
+            member_area_unit = f"{coordinate_unit}^2"
         else:
-            area = float(len(positions))
-            area_unit = "units"
-            diameter = np.nan
-            diameter_unit = "not_available"
+            member_area, member_area_unit = np.nan, "not_available"
         rows.append(
             {
                 "rank": rank,
                 "taxon": taxon,
                 "cluster_id": f"{rank}:{taxon}:{component + 1}",
-                "n_units": int(len(positions)),
-                "cluster_reads": float(y[positions].sum()),
-                "area": area,
-                "area_unit": area_unit,
-                "equivalent_diameter": diameter,
-                "diameter_unit": diameter_unit,
-                "centroid_x": float(xy[positions, 0].mean()),
-                "centroid_y": float(xy[positions, 1].mean()),
-                "peak_residual": float(np.nanmax(r[positions])),
+                "n_centres": np.nan if legacy else int(len(positions)),
+                "n_member_units": int(len(member)),
+                "member_reads": float(y[member].sum()) if len(member) else 0.0,
+                "member_area": member_area,
+                "member_area_unit": member_area_unit,
+                "n_shared_members": shared[component],
+                "centroid_x": float(xy[located, 0].mean()),
+                "centroid_y": float(xy[located, 1].mean()),
+                "peak_residual": float(np.nanmax(r[located])),
                 "localization_method": method,
                 "local_max_adjusted_p_min": float(np.min(local_p[positions])) if np.isfinite(local_p[positions]).any() else np.nan,
                 "peak_neighborhood_reads": float(np.max(neighborhood_reads[positions])),
                 "peak_neighborhood_expected": float(np.max(neighborhood_expected[positions])),
-                "component_supported": bool(len(positions) >= min_cluster_units),
-                "area_kind": "enriched_neighborhood_center_footprint" if method != "legacy_residual_threshold" else "residual_exceedance_footprint",
+                "component_supported": bool(len(member) >= min_cluster_units),
+                "area_kind": "residual_exceedance_footprint" if legacy else "excess_member_units",
             }
         )
     return pd.DataFrame(rows, columns=CLUSTER_COLUMNS)

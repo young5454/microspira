@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.0.dev2 — 2026-11-02
+
+- Context (MF1): remove the independence-based chi-square p/q and the
+  `context_*_associated` flag from per-domain output. Add a signed decile
+  contrast (`context_*_log_contrast`, `_fold_contrast`, `_direction`) and
+  `ms.replicate_context`, an exact sign test across independent domains with
+  optional grouping (e.g. animals) and BH across taxa.
+- Hotspots (MF2): count size and support in member units (units inside the
+  significant neighbourhoods with residual >= `member_z`), not centres. New
+  columns `n_centres`, `n_member_units`, `member_reads`, `member_area`,
+  `n_shared_members`; centroid and peak residual use member units. Equivalent
+  diameter removed.
+- Refit (MF3): `refit_bootstrap=True` is the default in `run()` and
+  `SPIRAConfig`, matching the Methods.
+- Preserve the low-level model default and the global/local bootstrap
+  algorithms. Document sign-test assumptions, unavailable outputs, schema
+  migration and finite-bootstrap resolution.
+
 ## 0.1.0.dev1 — 2026-10-19
 
 - Profile the free Poisson intercept, use stable conditional-likelihood Newton

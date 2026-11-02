@@ -56,7 +56,10 @@ class ApiTests(unittest.TestCase):
         )
         self.assertIn("feature", set(result.taxa["rank"]))
         self.assertIn("genus", set(result.taxa["rank"]))
-        self.assertIn("context_host_associated", result.taxa.columns)
+        self.assertIn("context_host_log_contrast", result.taxa.columns)
+        self.assertIn("context_host_direction", result.taxa.columns)
+        for removed in ("context_host_p", "context_host_q", "context_host_associated"):
+            self.assertNotIn(removed, result.taxa.columns)
         self.assertIn("support_tier", result.taxa.columns)
         self.assertIn("spatial_call", result.taxa.columns)
 

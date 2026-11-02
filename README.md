@@ -18,11 +18,13 @@ For every taxon and requested taxonomic rank, it reports:
 2. **Spatial evidence** — a residual Moran's I test after a user-defined
    *technical* mean model.
 3. **Context** — host, capture-boundary, tissue-interface, or cell-type
-   associations as independent, non-exclusive flags.
+   descriptors (deviance improvement and a signed decile contrast) per
+   analysis domain; association is tested across independent domains with
+   `ms.replicate_context`.
 4. **Taxonomic resolution** — native feature, species, genus, family, and
    other rank-wise reports when taxonomy columns are supplied.
-5. **Physical scale** — hotspot count, location, size, read support, and
-   equivalent diameter for FDR-positive spatial taxa.
+5. **Hotspot scale** — hotspot count, location, number of member units and
+   member read support for FDR-positive spatial taxa.
 
 The primary output has three states:
 
@@ -33,7 +35,23 @@ SPATIALLY_STRUCTURED
 ```
 
 `NO_EVIDENCE_OF_SPATIAL_STRUCTURE` does not mean biological absence. Context
-flags are associations, not causal explanations.
+descriptors and replicated associations are not causal explanations.
+
+Within one analysis domain, spatial units are dependent and context covariates
+are usually smooth, so no within-domain context p-value is reported: a
+spatially structured taxon would align partly with almost any smooth covariate
+by chance. Run one tissue section per `ms.run` call and combine calls:
+
+```python
+results = [ms.run(section, context_covariates={"boundary": "boundary_dist"})
+           for section in sections]
+ms.replicate_context(results, "boundary", groups=animal_ids)  # exact sign test + BH
+```
+
+At least six concordant independent units are needed for a two-sided sign-test
+p below 0.05; this does not guarantee a BH-adjusted q below 0.05. The sign-test
+null requires independent compared units with equally probable positive and
+negative nonzero contrasts. Availability filtering must not favour a direction.
 
 Version 0.1.0.dev1 additionally uses `INFERENCE_FAILED` for a supported taxon
 whose observed fit or requested bootstrap draws could not be validated. This
@@ -67,7 +85,7 @@ result = ms.run(
     microbial_adata,
     # Only variables justified as measurement/exposure controls belong here.
     technical_covariates=["capture_depth", "mito_frac"],
-    # These remain interpretable flags; they never remove a spatial call.
+    # Per-domain descriptors; they never remove a spatial call.
     context_covariates={
         "host_density": "host_density",
         "capture_boundary": "boundary_dist",
@@ -77,8 +95,8 @@ result = ms.run(
     coordinate_unit="um",
     unit_area=2500.0,
     n_neighbors=6,
-    n_boot=199,
-    # Use True for final calibration; False is a faster exploratory mode.
+    n_boot=999,
+    # Default True (Methods). False is for faster exploration only.
     refit_bootstrap=True,
 )
 
@@ -123,11 +141,23 @@ provide within-taxon adjusted candidate p-values, with model refitting when
 the primary test uses refitting. The same null draws serve both statistics.
 
 Only globally structured taxa receive cluster-table entries. Minimum local
-read support is required; small components remain marked by
-`component_supported=False`. `area_kind` states that reported areas are
-enriched-neighborhood-center footprints, not measured colony boundaries.
-This does not establish across-taxon local FDR control. Calibration and
-localization accuracy remain research validation tasks.
+read support is required. Connected significant centres form a component; its
+**member units** are the units inside the centres' neighbourhoods whose own
+standardized residual is at least `member_z` (default 1.96). Size and support
+are counted in member units (`n_member_units`, `member_reads`), so a single
+hot unit is one member and is marked `component_supported=False`, even though
+its excess makes several neighbouring centres significant. `member_area` is
+reported only when `unit_area` and `coordinate_unit` are supplied; no
+equivalent diameter is computed. Members are units carrying excess counts,
+not measured colony boundaries. This does not establish across-taxon local
+FDR control.
+
+Set `member_z` and `min_cluster_units` on `SPIRAConfig` (defaults 1.96 and 2).
+Shared members are assigned once: smallest component minimum local p, then
+largest peak neighbourhood reads, then lowest component index. The winning
+component records them in `n_shared_members`. A component with no qualifying
+members remains visible with support false; its centroid and peak residual
+fall back to the centre positions.
 
 Use `SPIRAConfig(localization_method="legacy_residual")` only to reproduce the
 previous descriptive residual cutoff. `hotspot_z` applies to that mode.
@@ -137,7 +167,7 @@ previous descriptive residual cutoff. `hotspot_z` applies to that mode.
 | Role | Examples | Consequence |
 |---|---|---|
 | Technical adjustment | exposure, platform QC, batch | enters primary residual test |
-| Context annotation | host density, tissue interface, cell type | independent association flag |
+| Context annotation | host density, tissue interface, cell type | per-domain descriptor; association tested across domains |
 
 The distinction is intentional. Tissue interface and host-density patterns can
 represent real microbial biology; SPIRA reports them rather than censoring
@@ -150,6 +180,35 @@ them.
 - Taxonomy columns in ``adata.var``.
 - kNN graph as the default spatial graph.
 - Local hotspots are descriptive summaries after a global FDR-positive call.
+
+## Analysis settings and migration from dev1
+
+- Analyze one tissue section per `run` call. Split capture areas containing
+  several sections before graph construction. Group sections from the same
+  animal with `replicate_context(..., groups=animal_ids)`.
+- Use the same context definition, units and orientation in every section.
+  Positive contrast for a distance means enrichment farther from the boundary.
+- Square bins require a justified graph (e.g. `n_neighbors=4` or `8`); the
+  default 6 is intended for a Visium-like hexagonal lattice. This is a setting,
+  not automatic platform detection.
+- Supply direct, non-cumulative taxonomic counts before rank aggregation.
+- `n_boot` remains 199 by default. The example uses 999, but the resolution
+  `1 / (n_boot + 1)` must be assessed against the planned BH family. For a
+  lone discovery among 300 tests at alpha 0.05, at least 5999 draws are needed
+  to reach the first BH threshold. There is no automatic choice or stopping.
+- `run` and `SPIRAConfig` now default to refitting; the low-level
+  `model.residual_spatial_test` default remains false for compatibility.
+  Explicit `refit_bootstrap=False` is still supported for exploration. Fast
+  mode can be conservative; calibration depends on the analysis setting.
+- Replace per-domain `context_*_p`, `_q` and `_associated` with descriptive
+  `context_*_log_contrast`, `_fold_contrast`, `_direction` and `_available`.
+  Replicated association has a separate table with `sign_test_p`,
+  `sign_test_q` and `replicated`.
+- Cluster columns `n_units`, `cluster_reads`, `area`, `area_unit`,
+  `equivalent_diameter` and `diameter_unit` are removed. Use `n_centres`,
+  `n_member_units`, `member_reads`, `member_area` and `member_area_unit`.
+  This is a change in definition, not a simple column rename. Update cached
+  cluster tables with the dev2 summarizer or rerun the analysis.
 
 ## Development priorities
 

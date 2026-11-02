@@ -39,7 +39,7 @@ def run(
     unit_area: float | None = None,
     spline_df: int = 3,
     n_boot: int = 199,
-    refit_bootstrap: bool = False,
+    refit_bootstrap: bool = True,
     alpha: float = 0.05,
     seed: int = 0,
     localize: bool = True,
@@ -58,15 +58,19 @@ def run(
         Variables used in the *primary* technical mean model. Choose variables
         whose adjustment is justified as measurement/exposure control.
     context_covariates
-        Mapping from a human-readable flag name to an ``.obs`` column. These
-        are reported as independent associations and never remove a spatial
-        call. Example: ``{"host_density": "host_density"}``.
+        Mapping from a human-readable label to an ``.obs`` column. These
+        receive descriptive summaries within one analysis domain, without
+        p/q-values or association flags, and never remove a spatial call.
+        Example: ``{"host_density": "host_density"}``. Use
+        ``replicate_context`` to test directions across independent domains.
     ranks
         Optional rank columns in ``.var`` to aggregate and test in addition to
         native input features, e.g. ``("species", "genus", "family")``.
     refit_bootstrap
-        Use model refitting for every null draw. This is slower but should be
-        enabled for final calibration and manuscript-grade inference.
+        Refit the mean model on every null draw (default, as specified in the
+        Methods). ``False`` reuses the observed fit and is intended only for
+        faster exploration. It can be conservative; this is not a universal
+        calibration guarantee.
 
     Returns
     -------
@@ -214,17 +218,7 @@ def run(
                         baseline_fit=baseline_fit,
                         spline_df=config.spline_df,
                     )
-                    row.update(
-                        {
-                            f"context_{safe}_column": column,
-                            f"context_{safe}_available": association.available,
-                            f"context_{safe}_delta_deviance": association.delta_deviance,
-                            f"context_{safe}_log_rate_range": association.log_rate_range,
-                            f"context_{safe}_p": association.p_value,
-                            f"context_{safe}_q": np.nan,
-                            f"context_{safe}_associated": False,
-                        }
-                    )
+                    row.update(_context_columns(safe, column, association))
                 diagnostics[key] = {
                     "residual": test.residual,
                     "fitted_mean": test.fitted_mean,
@@ -237,18 +231,7 @@ def run(
                 counts_cache[key] = y
             else:
                 for label, column in context.items():
-                    safe = _safe_label(label)
-                    row.update(
-                        {
-                            f"context_{safe}_column": column,
-                            f"context_{safe}_available": False,
-                            f"context_{safe}_delta_deviance": np.nan,
-                            f"context_{safe}_log_rate_range": np.nan,
-                            f"context_{safe}_p": np.nan,
-                            f"context_{safe}_q": np.nan,
-                            f"context_{safe}_associated": False,
-                        }
-                    )
+                    row.update(_context_columns(_safe_label(label), column, None))
             rows.append(row)
 
     taxa = pd.DataFrame(rows)
@@ -264,16 +247,8 @@ def run(
     taxa.loc[tested & taxa.inference_valid & ~(taxa.spatial_q <= config.alpha), "spatial_call"] = NO_EVIDENCE
     taxa.loc[failed, "spatial_call"] = INFERENCE_FAILED
 
-    for label in context:
-        safe = _safe_label(label)
-        p_col, q_col, flag_col = (
-            f"context_{safe}_p",
-            f"context_{safe}_q",
-            f"context_{safe}_associated",
-        )
-        taxa[q_col] = benjamini_hochberg(taxa[p_col].to_numpy())
-        taxa[flag_col] = taxa[q_col] <= config.alpha
-
+    # Context columns are per-domain descriptors only (no p/q/flag here);
+    # association across independent domains: microspira.replicate_context.
     clusters = _collect_clusters(taxa, diagnostics, counts_cache, W, coords, config)
     taxa = taxa.sort_values(["rank", "spatial_q", "taxon"], na_position="last").reset_index(drop=True)
     return SPIRAResult(
@@ -310,6 +285,7 @@ def _collect_clusters(taxa, diagnostics, counts_cache, W, coords, config) -> pd.
                 local_alpha=config.local_alpha,
                 min_neighborhood_reads=config.min_neighborhood_reads,
                 min_cluster_units=config.min_cluster_units,
+                member_z=config.member_z,
             )
         if len(frame):
             frames.append(frame)
@@ -351,6 +327,30 @@ def _column(matrix, index: int) -> np.ndarray:
     if sparse.issparse(matrix):
         return np.asarray(matrix.getcol(index).toarray()).ravel()
     return np.asarray(matrix[:, index]).ravel()
+
+
+def _context_columns(safe: str, column: str, association) -> dict:
+    """Per-domain context descriptor columns; ``association=None`` means not tested."""
+    if association is None:
+        values = dict(available=False, delta_deviance=np.nan, df=0, log_rate_range=np.nan,
+                      log_contrast=np.nan, direction=0, message="not testable")
+    else:
+        values = dict(available=association.available, delta_deviance=association.delta_deviance,
+                      df=association.degrees_of_freedom, log_rate_range=association.log_rate_range,
+                      log_contrast=association.log_contrast, direction=association.direction,
+                      message=association.message)
+    contrast = values["log_contrast"]
+    return {
+        f"context_{safe}_column": column,
+        f"context_{safe}_available": values["available"],
+        f"context_{safe}_delta_deviance": values["delta_deviance"],
+        f"context_{safe}_df": values["df"],
+        f"context_{safe}_log_rate_range": values["log_rate_range"],
+        f"context_{safe}_log_contrast": contrast,
+        f"context_{safe}_fold_contrast": float(np.exp(contrast)) if np.isfinite(contrast) else np.nan,
+        f"context_{safe}_direction": values["direction"],
+        f"context_{safe}_message": values["message"],
+    }
 
 
 def _safe_label(label: str) -> str:

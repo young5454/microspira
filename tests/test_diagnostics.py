@@ -98,8 +98,10 @@ class DiagnosticTests(unittest.TestCase):
         self.assertGreater(len(report.clusters), 0)
         self.assertTrue(report.clusters.component_supported.all())
         self.assertTrue(report.clusters.localization_method.eq("bootstrap_neighborhood_max").all())
-        self.assertTrue(report.clusters.equivalent_diameter.isna().all())
-        self.assertTrue(report.clusters.diameter_unit.eq("not_available").all())
+        self.assertTrue((report.clusters.n_member_units >= 2).all())
+        self.assertTrue(report.clusters.member_area.isna().all())
+        self.assertTrue(report.clusters.member_area_unit.eq("not_available").all())
+        self.assertNotIn("equivalent_diameter", report.clusters.columns)
 
     def test_intercept_only_fast_and_refit_use_identical_nulls(self):
         y = ((self.coords[:, 0] < 3) & (self.coords[:, 1] < 3)).astype(int) * 20

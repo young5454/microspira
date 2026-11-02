@@ -7,14 +7,16 @@ small at its decision layer:
 2. Does it show residual spatial structure after technical adjustment?
 
 Host, tissue-interface, and capture-boundary relationships are returned as
-independent contextual annotations rather than automatic exclusion labels.
+per-domain descriptors, with association assessed across independent domains.
 """
 
 from .api import run
 from .config import SPIRAConfig, SupportConfig
 from .report import SPIRAResult
 from .validate import ValidationError, validate
+from .replicate import replicate_context
 
-__all__ = ["run", "validate", "ValidationError", "SPIRAConfig", "SupportConfig", "SPIRAResult"]
-__version__ = "0.1.0.dev1"
+__all__ = ["run", "validate", "ValidationError", "SPIRAConfig", "SupportConfig", "SPIRAResult",
+           "replicate_context"]
+__version__ = "0.1.0.dev2"
 

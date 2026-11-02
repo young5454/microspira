@@ -29,8 +29,9 @@ class SPIRAConfig:
     """Configuration for :func:`microspira.run`.
 
     ``technical_covariates`` are adjusted in the primary residual spatial test.
-    ``context_covariates`` are *not* used to drop a taxon: they receive their
-    own association columns and flags in the final report.
+    ``context_covariates`` receive per-domain descriptors without p/q-values
+    or association flags and are *not* used to drop a taxon. Context direction
+    can be tested across independent domains with ``replicate_context``.
     """
 
     technical_covariates: Sequence[str] = field(default_factory=tuple)
@@ -42,7 +43,7 @@ class SPIRAConfig:
     n_neighbors: int = 6
     spline_df: int = 3
     n_boot: int = 199
-    refit_bootstrap: bool = False
+    refit_bootstrap: bool = True
     alpha: float = 0.05
     seed: int = 0
     localize: bool = True
@@ -51,6 +52,7 @@ class SPIRAConfig:
     local_alpha: float = 0.05
     min_neighborhood_reads: int = 3
     min_cluster_units: int = 2
+    member_z: float = 1.96
     support: SupportConfig = field(default_factory=SupportConfig)
 
     def as_dict(self) -> dict:
