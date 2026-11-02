@@ -13,7 +13,7 @@ from .clusters import CLUSTER_COLUMNS, localize_hotspots
 from .config import SPIRAConfig
 from .context import assess_context_association
 from .graph import build_knn_graph
-from .model import design_matrix, fit_poisson_gam, residual_spatial_test
+from .model import design_matrix, residual_spatial_test
 from .report import SPIRAResult
 from .spatial import benjamini_hochberg
 from .support import NOT_TESTABLE, assess_support
@@ -23,6 +23,7 @@ from .validate import validate
 
 NO_EVIDENCE = "NO_EVIDENCE_OF_SPATIAL_STRUCTURE"
 STRUCTURED = "SPATIALLY_STRUCTURED"
+INFERENCE_FAILED = "INFERENCE_FAILED"
 
 
 def run(
@@ -119,6 +120,10 @@ def run(
     coords = np.asarray(microbial_adata.obsm[config.spatial_key], dtype=float)[:, :2]
     technical = tuple(config.technical_covariates)
     context = dict(config.context_covariates)
+    if config.localization_method not in ("bootstrap_neighborhood", "legacy_residual"):
+        raise ValueError("localization_method must be bootstrap_neighborhood or legacy_residual.")
+    if not 0 < config.local_alpha < 1 or config.min_neighborhood_reads < 1 or config.min_cluster_units < 1:
+        raise ValueError("Local alpha/support settings are invalid.")
     _require_obs_columns(obs, technical)
 
     W = graph.tocsr() if graph is not None else build_knn_graph(coords, config.n_neighbors)
@@ -155,6 +160,17 @@ def run(
                 "spatial_call": NOT_TESTABLE if not support.testable else NO_EVIDENCE,
                 "fit_converged": False,
                 "bootstrap_refit": config.refit_bootstrap,
+                "inference_valid": False,
+                "fit_n_iter": 0,
+                "fit_message": "not tested",
+                "fit_mean_relative_change": np.nan,
+                "fit_objective_relative_change": np.nan,
+                "fit_scaled_score": np.nan,
+                "bootstrap_n_valid": 0,
+                "bootstrap_fit_failures": 0,
+                "bootstrap_invalid_statistics": 0,
+                "bootstrap_max_n_iter": 0,
+                "inference_failure_reason": "not_testable" if not support.testable else "",
             }
             if support.testable:
                 test = residual_spatial_test(
@@ -164,6 +180,7 @@ def run(
                     n_draws=config.n_boot,
                     rng=rng,
                     refit_bootstrap=config.refit_bootstrap,
+                    localize=config.localize and config.localization_method == "bootstrap_neighborhood",
                 )
                 row.update(
                     {
@@ -172,9 +189,20 @@ def run(
                         "spatial_null_sd": test.null_sd,
                         "spatial_p": test.p_value,
                         "fit_converged": test.fit_converged,
+                        "inference_valid": test.inference_valid,
+                        "fit_n_iter": test.fit.n_iter,
+                        "fit_message": test.fit.message,
+                        "fit_mean_relative_change": test.fit.mean_relative_change,
+                        "fit_objective_relative_change": test.fit.objective_relative_change,
+                        "fit_scaled_score": test.fit.scaled_score,
+                        "bootstrap_n_valid": test.bootstrap_n_valid,
+                        "bootstrap_fit_failures": test.bootstrap_fit_failures,
+                        "bootstrap_invalid_statistics": test.bootstrap_invalid_statistics,
+                        "bootstrap_max_n_iter": test.bootstrap_max_n_iter,
+                        "inference_failure_reason": test.failure_reason,
                     }
                 )
-                baseline_fit = fit_poisson_gam(y, X_technical)
+                baseline_fit = test.fit
                 for label, column in context.items():
                     safe = _safe_label(label)
                     association = assess_context_association(
@@ -201,6 +229,10 @@ def run(
                     "residual": test.residual,
                     "fitted_mean": test.fitted_mean,
                     "members": aggregation.members[str(taxon)],
+                    "local_score": test.local_score,
+                    "local_p": test.local_p,
+                    "neighborhood_reads": test.neighborhood_reads,
+                    "neighborhood_expected": test.neighborhood_expected,
                 }
                 counts_cache[key] = y
             else:
@@ -220,10 +252,17 @@ def run(
             rows.append(row)
 
     taxa = pd.DataFrame(rows)
-    taxa["spatial_q"] = benjamini_hochberg(taxa["spatial_p"].to_numpy())
     tested = taxa["support_tier"].ne(NOT_TESTABLE)
-    taxa.loc[tested & (taxa["spatial_q"] <= config.alpha), "spatial_call"] = STRUCTURED
-    taxa.loc[tested & ~(taxa["spatial_q"] <= config.alpha), "spatial_call"] = NO_EVIDENCE
+    failed = tested & ~taxa["inference_valid"]
+    adjustment_p = taxa["spatial_p"].to_numpy().copy()
+    # Failed testable fits remain in the multiplicity family as p=1 placeholders.
+    # Their published p/q remain unavailable, never a negative scientific call.
+    adjustment_p[failed.to_numpy()] = 1.0
+    taxa["spatial_q"] = benjamini_hochberg(adjustment_p)
+    taxa.loc[failed, "spatial_q"] = np.nan
+    taxa.loc[tested & taxa.inference_valid & (taxa.spatial_q <= config.alpha), "spatial_call"] = STRUCTURED
+    taxa.loc[tested & taxa.inference_valid & ~(taxa.spatial_q <= config.alpha), "spatial_call"] = NO_EVIDENCE
+    taxa.loc[failed, "spatial_call"] = INFERENCE_FAILED
 
     for label in context:
         safe = _safe_label(label)
@@ -255,8 +294,7 @@ def _collect_clusters(taxa, diagnostics, counts_cache, W, coords, config) -> pd.
         diagnostic = diagnostics.get(key)
         if diagnostic is None:
             continue
-        frames.append(
-            localize_hotspots(
+        frame = localize_hotspots(
                 counts_cache[key],
                 diagnostic["residual"],
                 W,
@@ -266,8 +304,15 @@ def _collect_clusters(taxa, diagnostics, counts_cache, W, coords, config) -> pd.
                 z_threshold=config.hotspot_z,
                 unit_area=config.unit_area,
                 coordinate_unit=config.coordinate_unit,
+                local_p=diagnostic["local_p"] if config.localization_method == "bootstrap_neighborhood" else None,
+                neighborhood_reads=diagnostic["neighborhood_reads"],
+                neighborhood_expected=diagnostic["neighborhood_expected"],
+                local_alpha=config.local_alpha,
+                min_neighborhood_reads=config.min_neighborhood_reads,
+                min_cluster_units=config.min_cluster_units,
             )
-        )
+        if len(frame):
+            frames.append(frame)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=CLUSTER_COLUMNS)
 
 

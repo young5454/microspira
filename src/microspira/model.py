@@ -1,8 +1,8 @@
 """Spline Poisson mean models and conditional residual bootstrap tests.
 
 The implementation deliberately avoids a mandatory heavy modelling dependency.
-It uses a small ridge-stabilised Poisson IRLS solver because SPIRA needs many
-taxon-wise fits with a modest number of spline columns.
+It profiles the free intercept and solves the equivalent ridge-stabilised
+conditional likelihood with Newton steps. Total counts are preserved exactly.
 """
 
 from __future__ import annotations
@@ -13,8 +13,10 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from scipy.interpolate import BSpline
+from scipy.special import logsumexp
 
 from .spatial import morans_i
+from .clusters import neighborhood_operator, neighborhood_enrichment
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,10 @@ class PoissonFit:
     converged: bool
     n_iter: int
     message: str = ""
+    objective: float = np.nan
+    objective_relative_change: float = np.nan
+    mean_relative_change: float = np.nan
+    scaled_score: float = np.nan
 
 
 @dataclass(frozen=True)
@@ -38,6 +44,17 @@ class ResidualSpatialTest:
     fit_converged: bool
     bootstrap_refit: bool
     n_draws: int
+    fit: PoissonFit | None = None
+    inference_valid: bool = False
+    bootstrap_n_valid: int = 0
+    bootstrap_fit_failures: int = 0
+    bootstrap_invalid_statistics: int = 0
+    bootstrap_max_n_iter: int = 0
+    local_score: np.ndarray | None = None
+    local_p: np.ndarray | None = None
+    neighborhood_reads: np.ndarray | None = None
+    neighborhood_expected: np.ndarray | None = None
+    failure_reason: str = ""
 
 
 def spline_basis(values: np.ndarray, df: int = 3) -> np.ndarray:
@@ -95,17 +112,27 @@ def fit_poisson_gam(
     X: np.ndarray,
     *,
     offset: np.ndarray | None = None,
-    max_iter: int = 100,
+    max_iter: int = 200,
     tol: float = 1e-8,
     ridge: float = 1e-6,
 ) -> PoissonFit:
-    """Fit a ridge-stabilised Poisson GLM by iteratively reweighted least squares."""
+    """Fit a Poisson spline mean with its free intercept profiled out.
+
+    This is the same intercept-plus-slope Poisson likelihood with a ridge on
+    slopes only. Log-sum-exp avoids clipped rates; the stopping rule requires
+    a small scaled score and stable fitted means/objective. Large changes in
+    poorly identified coefficients alone are not treated as fitting failures.
+    """
     y = np.asarray(counts, dtype=float).ravel()
     X = np.asarray(X, dtype=float)
     if X.ndim != 2 or X.shape[0] != y.size:
         raise ValueError("X must be a two-dimensional matrix aligned to counts.")
     if np.any(y < 0) or not np.all(np.isfinite(y)):
         raise ValueError("counts must be finite and non-negative.")
+    if X.shape[1] < 1 or not np.all(np.isfinite(X)) or not np.allclose(X[:, 0], 1.0):
+        raise ValueError("X must be finite and its first column must be an intercept of ones.")
+    if max_iter < 1 or tol <= 0 or ridge < 0 or not np.isfinite([tol, ridge]).all():
+        raise ValueError("max_iter/tol must be positive and ridge must be finite and non-negative.")
     if y.sum() <= 0:
         return PoissonFit(
             mu=np.zeros_like(y),
@@ -123,60 +150,63 @@ def fit_poisson_gam(
         if off.size != y.size or not np.all(np.isfinite(off)):
             raise ValueError("offset must be finite and aligned to counts.")
 
-    beta = np.zeros(X.shape[1], dtype=float)
-    exposure = np.exp(np.clip(off, -20.0, 20.0))
-    beta[0] = np.log(max(y.sum() / exposure.sum(), 1e-12))
-    penalty = np.eye(X.shape[1]) * ridge
-    penalty[0, 0] = 0.0
-    previous_deviance = np.inf
+    total = float(y.sum())
+    Z = X[:, 1:]
+    theta = np.zeros(Z.shape[1])
 
-    for iteration in range(1, max_iter + 1):
-        eta = np.clip(off + X @ beta, -30.0, 30.0)
-        mu = np.exp(eta)
-        weights = np.clip(mu, 1e-10, None)
-        working = eta + (y - mu) / weights
+    def evaluate(slopes):
+        eta = off + Z @ slopes
+        normalizer = logsumexp(eta)
+        log_probability = eta - normalizer
+        probability = np.exp(log_probability)
+        mu = total * probability
+        objective = float(-y @ log_probability + 0.5 * ridge * np.dot(slopes, slopes))
+        score = Z.T @ (mu - y) + ridge * slopes
+        return objective, mu, score, normalizer
 
-        lhs = X.T @ (X * weights[:, None]) + penalty
-        rhs = X.T @ (weights * (working - off))
+    objective, mu, score, normalizer = evaluate(theta)
+    objective_change = mean_change = 0.0
+    scaled_score = float(np.max(np.abs(score), initial=0.0) / max(total, 1.0))
+    converged = Z.shape[1] == 0
+    message = "intercept profiled" if converged else "maximum iterations reached"
+    iteration = 0
+    score_tolerance = max(1e-7, 10.0 * tol)
+    for iteration in range(1, max_iter + 1) if not converged else ():
+        probability = mu / total
+        mean_Z = probability @ Z
+        hessian = Z.T @ (Z * mu[:, None]) - total * np.outer(mean_Z, mean_Z)
+        hessian += np.eye(Z.shape[1]) * ridge
         try:
-            candidate = np.linalg.solve(lhs, rhs)
+            direction = np.linalg.solve(hessian, score)
         except np.linalg.LinAlgError:
-            candidate = np.linalg.lstsq(lhs, rhs, rcond=None)[0]
-
-        # A conservative half-step prevents rare taxa from making unstable IRLS jumps.
-        step = 1.0
-        candidate_deviance = np.inf
-        while step >= 1.0 / 64.0:
-            proposed = beta + step * (candidate - beta)
-            proposed_mu = np.exp(np.clip(off + X @ proposed, -30.0, 30.0))
-            candidate_deviance = poisson_deviance(y, proposed_mu)
-            if candidate_deviance <= previous_deviance + 1e-8:
+            direction = np.linalg.lstsq(hessian, score, rcond=None)[0]
+        if not np.isfinite(direction).all():
+            message = "non-finite Newton direction"
+            break
+        step, accepted = 1.0, False
+        allowance = 1e-12 * (1.0 + abs(objective))
+        for _ in range(30):
+            proposed = theta - step * direction
+            new_objective, new_mu, new_score, new_normalizer = evaluate(proposed)
+            if np.isfinite(new_objective) and new_objective <= objective + allowance:
+                accepted = True
                 break
             step *= 0.5
-
-        beta_new = beta + step * (candidate - beta)
-        change = float(np.max(np.abs(beta_new - beta)))
-        beta = beta_new
-        previous_deviance = candidate_deviance
-        if change < tol:
-            mu = np.exp(np.clip(off + X @ beta, -30.0, 30.0))
-            return PoissonFit(
-                mu=_normalise_mu(mu, y.sum()),
-                coefficients=beta,
-                deviance=poisson_deviance(y, mu),
-                converged=True,
-                n_iter=iteration,
-            )
-
-    mu = np.exp(np.clip(off + X @ beta, -30.0, 30.0))
-    return PoissonFit(
-        mu=_normalise_mu(mu, y.sum()),
-        coefficients=beta,
-        deviance=poisson_deviance(y, mu),
-        converged=False,
-        n_iter=max_iter,
-        message="maximum iterations reached",
-    )
+        if not accepted:
+            message = "line search did not find an admissible step"
+            break
+        objective_change = abs(new_objective - objective) / (1.0 + abs(objective))
+        mean_change = float(np.abs(new_mu - mu).sum() / max(total, 1.0))
+        theta, objective, mu, score, normalizer = proposed, new_objective, new_mu, new_score, new_normalizer
+        scaled_score = float(np.max(np.abs(score), initial=0.0) / max(total, 1.0))
+        if scaled_score <= score_tolerance and objective_change <= tol and mean_change <= tol:
+            converged, message = True, "stable mean/objective and small scaled score"
+            break
+    beta = np.r_[np.log(total) - normalizer, theta]
+    return PoissonFit(mu=mu, coefficients=beta, deviance=poisson_deviance(y, mu),
+        converged=converged, n_iter=iteration, message=message, objective=objective,
+        objective_relative_change=objective_change, mean_relative_change=mean_change,
+        scaled_score=scaled_score)
 
 
 def poisson_deviance(counts: np.ndarray, mu: np.ndarray) -> float:
@@ -199,6 +229,7 @@ def residual_spatial_test(
     rng: np.random.Generator | None = None,
     refit_bootstrap: bool = False,
     offset: np.ndarray | None = None,
+    localize: bool = False,
 ) -> ResidualSpatialTest:
     """Test positive residual spatial clustering under a conditional null.
 
@@ -213,7 +244,7 @@ def residual_spatial_test(
     fit = fit_poisson_gam(y, X, offset=offset)
     residual = conditional_residual(y, fit.mu)
     observed = morans_i(residual, W)
-    if not np.isfinite(observed):
+    if not np.isfinite(observed) or not fit.converged:
         return ResidualSpatialTest(
             observed_i=np.nan,
             null_mean=np.nan,
@@ -224,29 +255,58 @@ def residual_spatial_test(
             fit_converged=fit.converged,
             bootstrap_refit=refit_bootstrap,
             n_draws=n_draws,
+            fit=fit,
+            failure_reason="observed_fit_not_converged" if not fit.converged else "observed_statistic_non_finite",
         )
 
     probability = fit.mu / fit.mu.sum()
     null_i = np.empty(n_draws, dtype=float)
+    local_operator = neighborhood_operator(W) if localize else None
+    local_score = neighborhood_reads = neighborhood_expected = None
+    local_maxima = np.empty(n_draws) if localize else None
+    if localize:
+        local_score, neighborhood_reads, neighborhood_expected = neighborhood_enrichment(y, fit.mu, local_operator)
+    fit_failures = 0
+    maximum_iterations = 0
+    fit_valid = np.ones(n_draws, dtype=bool)
     for b in range(n_draws):
         draw = generator.multinomial(int(np.rint(y.sum())), probability).astype(float)
         if refit_bootstrap:
             null_fit = fit_poisson_gam(draw, X, offset=offset)
+            maximum_iterations = max(maximum_iterations, null_fit.n_iter)
+            fit_valid[b] = null_fit.converged
+            fit_failures += int(not null_fit.converged)
             null_residual = conditional_residual(draw, null_fit.mu)
+            null_mu = null_fit.mu
         else:
             null_residual = conditional_residual(draw, fit.mu)
+            null_mu = fit.mu
         null_i[b] = morans_i(null_residual, W)
+        if localize:
+            scores, _, _ = neighborhood_enrichment(draw, null_mu, local_operator)
+            local_maxima[b] = np.max(scores)
 
-    valid = np.isfinite(null_i)
-    null_i = null_i[valid]
-    if not len(null_i):
+    finite = np.isfinite(null_i)
+    if localize:
+        finite &= np.isfinite(local_maxima)
+    valid = finite & fit_valid
+    inference_valid = bool(valid.all())
+    valid_i = null_i[valid]
+    if not len(valid_i):
         p_value = np.nan
         null_mean = np.nan
         null_sd = np.nan
     else:
-        p_value = float((1 + np.sum(null_i >= observed)) / (1 + len(null_i)))
-        null_mean = float(null_i.mean())
-        null_sd = float(null_i.std(ddof=1)) if len(null_i) > 1 else 0.0
+        p_value = float((1 + np.sum(null_i >= observed)) / (1 + n_draws)) if inference_valid else np.nan
+        null_mean = float(valid_i.mean())
+        null_sd = float(valid_i.std(ddof=1)) if len(valid_i) > 1 else 0.0
+    local_p = None
+    if localize:
+        local_p = np.full_like(local_score, np.nan)
+        if inference_valid:
+            # Sort maxima once: no B x n_units dense comparison matrix.
+            position = np.searchsorted(np.sort(local_maxima), local_score, side="left")
+            local_p = (1.0 + n_draws - position) / (1.0 + n_draws)
 
     return ResidualSpatialTest(
         observed_i=float(observed),
@@ -258,6 +318,19 @@ def residual_spatial_test(
         fit_converged=fit.converged,
         bootstrap_refit=refit_bootstrap,
         n_draws=n_draws,
+        fit=fit,
+        inference_valid=inference_valid,
+        bootstrap_n_valid=int(valid.sum()),
+        bootstrap_fit_failures=fit_failures,
+        bootstrap_invalid_statistics=int((~finite).sum()),
+        bootstrap_max_n_iter=maximum_iterations,
+        local_score=local_score,
+        local_p=local_p,
+        neighborhood_reads=neighborhood_reads,
+        neighborhood_expected=neighborhood_expected,
+        failure_reason=",".join(reason for condition, reason in (
+            (fit_failures > 0, "bootstrap_fit_not_converged"),
+            ((~finite).any(), "bootstrap_statistic_non_finite")) if condition),
     )
 
 

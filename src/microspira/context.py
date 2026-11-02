@@ -70,6 +70,10 @@ def assess_context_association(
     base = baseline_fit or fit_poisson_gam(counts, technical_X)
     augmented_X = np.hstack([technical_X, context_basis])
     augmented = fit_poisson_gam(counts, augmented_X)
+    if not base.converged or not augmented.converged:
+        return ContextAssociation(label=label, column=column, delta_deviance=np.nan,
+            degrees_of_freedom=context_basis.shape[1], p_value=np.nan,
+            log_rate_range=np.nan, available=False, message="context model did not converge")
     delta = max(0.0, float(base.deviance - augmented.deviance))
     df = int(context_basis.shape[1])
     p_value = float(chi2.sf(delta, df)) if df else 1.0

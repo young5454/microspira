@@ -47,6 +47,10 @@ class SPIRAConfig:
     seed: int = 0
     localize: bool = True
     hotspot_z: float = 1.96
+    localization_method: str = "bootstrap_neighborhood"
+    local_alpha: float = 0.05
+    min_neighborhood_reads: int = 3
+    min_cluster_units: int = 2
     support: SupportConfig = field(default_factory=SupportConfig)
 
     def as_dict(self) -> dict:

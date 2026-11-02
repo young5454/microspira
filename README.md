@@ -35,6 +35,11 @@ SPATIALLY_STRUCTURED
 `NO_EVIDENCE_OF_SPATIAL_STRUCTURE` does not mean biological absence. Context
 flags are associations, not causal explanations.
 
+Version 0.1.0.dev1 additionally uses `INFERENCE_FAILED` for a supported taxon
+whose observed fit or requested bootstrap draws could not be validated. This
+is a numerical status, not negative biological evidence. Such rows publish
+unavailable p/q and remain in the BH family through p=1 placeholders.
+
 ## Installation
 
 ```bash
@@ -102,6 +107,30 @@ r_{it} = \frac{Y_{it}-\hat\mu_{it}}
 and tests positive Moran's I of that residual against conditional multinomial
 bootstrap draws. ``refit_bootstrap=True`` refits the mean model on each draw to
 capture fitted-model uncertainty.
+
+The solver profiles the free intercept and optimizes the same Poisson
+likelihood with a small ridge on spline coefficients. It records iteration
+count, fitted-mean/objective change and scaled score. Bootstrap columns include
+`bootstrap_n_valid`, `bootstrap_fit_failures`, `bootstrap_invalid_statistics`
+and `bootstrap_max_n_iter`. Failed draws are not silently discarded.
+
+## Neighborhood localization (development version)
+
+The default uses fixed center-plus-one-hop neighborhoods. Their count
+enrichment is scored by a conditional binomial upper tail; the score itself
+is not treated as a calibrated p-value. Bootstrap maxima across all centers
+provide within-taxon adjusted candidate p-values, with model refitting when
+the primary test uses refitting. The same null draws serve both statistics.
+
+Only globally structured taxa receive cluster-table entries. Minimum local
+read support is required; small components remain marked by
+`component_supported=False`. `area_kind` states that reported areas are
+enriched-neighborhood-center footprints, not measured colony boundaries.
+This does not establish across-taxon local FDR control. Calibration and
+localization accuracy remain research validation tasks.
+
+Use `SPIRAConfig(localization_method="legacy_residual")` only to reproduce the
+previous descriptive residual cutoff. `hotspot_z` applies to that mode.
 
 ## Covariate roles
 

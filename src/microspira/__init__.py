@@ -16,5 +16,5 @@ from .report import SPIRAResult
 from .validate import ValidationError, validate
 
 __all__ = ["run", "validate", "ValidationError", "SPIRAConfig", "SupportConfig", "SPIRAResult"]
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0.dev1"
 
