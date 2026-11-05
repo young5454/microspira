@@ -18,5 +18,5 @@ from .replicate import replicate_context
 
 __all__ = ["run", "validate", "ValidationError", "SPIRAConfig", "SupportConfig", "SPIRAResult",
            "replicate_context"]
-__version__ = "0.1.0.dev2"
+__version__ = "0.1.0.dev3"
 

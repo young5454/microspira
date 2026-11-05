@@ -14,6 +14,7 @@ from .config import SPIRAConfig
 from .context import assess_context_association
 from .graph import build_knn_graph
 from .model import design_matrix, residual_spatial_test
+from .dispersion import OVERDISPERSION_METHODS, graph_edges
 from .report import SPIRAResult
 from .spatial import benjamini_hochberg
 from .support import NOT_TESTABLE, assess_support
@@ -44,6 +45,7 @@ def run(
     seed: int = 0,
     localize: bool = True,
     hotspot_z: float = 1.96,
+    overdispersion: str = "neighbour",
     config: SPIRAConfig | None = None,
 ) -> SPIRAResult:
     """Run support, spatial-pattern, context, taxonomy, and cluster reporting.
@@ -71,6 +73,12 @@ def run(
         Methods). ``False`` reuses the observed fit and is intended only for
         faster exploration. It can be conservative; this is not a universal
         calibration guarantee.
+    overdispersion
+        ``"neighbour"`` (default) allows independent unit-level heterogeneity
+        around the technical mean: a per-taxon dispersion is estimated from
+        neighbour differences, residuals use the overdispersed variance, null
+        draws include Gamma factors and the dispersion is re-estimated on each
+        draw. ``"none"`` reproduces the 0.1.0.dev2 multinomial null exactly.
 
     Returns
     -------
@@ -95,6 +103,7 @@ def run(
             seed=seed,
             localize=localize,
             hotspot_z=hotspot_z,
+            overdispersion=overdispersion,
         )
     else:
         config = SPIRAConfig(
@@ -112,6 +121,7 @@ def run(
             seed=seed,
             localize=localize,
             hotspot_z=hotspot_z,
+            overdispersion=overdispersion,
         )
 
     rank_columns = tuple(r for r in config.ranks if r != "feature")
@@ -124,6 +134,8 @@ def run(
     coords = np.asarray(microbial_adata.obsm[config.spatial_key], dtype=float)[:, :2]
     technical = tuple(config.technical_covariates)
     context = dict(config.context_covariates)
+    if config.overdispersion not in OVERDISPERSION_METHODS:
+        raise ValueError(f"overdispersion must be one of {OVERDISPERSION_METHODS}.")
     if config.localization_method not in ("bootstrap_neighborhood", "legacy_residual"):
         raise ValueError("localization_method must be bootstrap_neighborhood or legacy_residual.")
     if not 0 < config.local_alpha < 1 or config.min_neighborhood_reads < 1 or config.min_cluster_units < 1:
@@ -131,6 +143,7 @@ def run(
     _require_obs_columns(obs, technical)
 
     W = graph.tocsr() if graph is not None else build_knn_graph(coords, config.n_neighbors)
+    edges = graph_edges(W) if config.overdispersion == "neighbour" else None
     if W.shape != (len(obs), len(obs)):
         raise ValueError("Provided graph dimensions do not match microbial_adata.obs.")
     X_technical = design_matrix(obs, technical, df=config.spline_df)
@@ -174,6 +187,10 @@ def run(
                 "bootstrap_fit_failures": 0,
                 "bootstrap_invalid_statistics": 0,
                 "bootstrap_max_n_iter": 0,
+                "dispersion_model": _dispersion_model(config.overdispersion),
+                "dispersion_kappa": np.nan,
+                "dispersion_lambda": np.nan,
+                "dispersion_null_median": np.nan,
                 "inference_failure_reason": "not_testable" if not support.testable else "",
             }
             if support.testable:
@@ -185,6 +202,8 @@ def run(
                     rng=rng,
                     refit_bootstrap=config.refit_bootstrap,
                     localize=config.localize and config.localization_method == "bootstrap_neighborhood",
+                    overdispersion=config.overdispersion,
+                    edges=edges,
                 )
                 row.update(
                     {
@@ -203,6 +222,10 @@ def run(
                         "bootstrap_fit_failures": test.bootstrap_fit_failures,
                         "bootstrap_invalid_statistics": test.bootstrap_invalid_statistics,
                         "bootstrap_max_n_iter": test.bootstrap_max_n_iter,
+                        "dispersion_kappa": test.dispersion_kappa,
+                        # expected reads per unit x kappa: how far the taxon is from Poisson-like
+                        "dispersion_lambda": float(test.dispersion_kappa * y.sum() / len(y)),
+                        "dispersion_null_median": test.dispersion_null_median,
                         "inference_failure_reason": test.failure_reason,
                     }
                 )
@@ -227,6 +250,7 @@ def run(
                     "local_p": test.local_p,
                     "neighborhood_reads": test.neighborhood_reads,
                     "neighborhood_expected": test.neighborhood_expected,
+                    "dispersion_kappa": test.dispersion_kappa,
                 }
                 counts_cache[key] = y
             else:
@@ -351,6 +375,10 @@ def _context_columns(safe: str, column: str, association) -> dict:
         f"context_{safe}_direction": values["direction"],
         f"context_{safe}_message": values["message"],
     }
+
+
+def _dispersion_model(method: str) -> str:
+    return "gamma_multinomial_neighbour" if method == "neighbour" else "multinomial"
 
 
 def _safe_label(label: str) -> str:

@@ -122,9 +122,21 @@ r_{it} = \frac{Y_{it}-\hat\mu_{it}}
 {\sqrt{\mathrm{Var}(Y_{it}\mid\sum_iY_{it})}}
 \]
 
-and tests positive Moran's I of that residual against conditional multinomial
-bootstrap draws. ``refit_bootstrap=True`` refits the mean model on each draw to
-capture fitted-model uncertainty.
+and tests positive Moran's I of that residual against conditional bootstrap
+draws. ``refit_bootstrap=True`` refits the mean model on each draw to capture
+fitted-model uncertainty.
+
+Since 0.1.0.dev3 the null allows independent unit-level overdispersion
+(``overdispersion="neighbour"``, the default): each unit's probability carries
+an independent Gamma factor with mean 1 and variance \(\kappa_t\). \(\kappa_t\)
+is estimated from differences between graph neighbours (insensitive to smooth
+spatial structure), the residual variance becomes
+\(N_t p_{it}(1-p_{it}) + \kappa_t\hat\mu_{it}^2\), bootstrap draws include
+the Gamma factors, and \(\kappa_t\) is re-estimated on every draw.
+``overdispersion="none"`` reproduces the dev2 multinomial null. Without this,
+unit-level overdispersion makes the local max-T step report isolated
+excess units as hotspots and makes the global test mildly liberal for abundant
+taxa.
 
 The solver profiles the free intercept and optimizes the same Poisson
 likelihood with a small ridge on spline coefficients. It records iteration

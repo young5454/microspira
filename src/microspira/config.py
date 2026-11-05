@@ -53,6 +53,7 @@ class SPIRAConfig:
     min_neighborhood_reads: int = 3
     min_cluster_units: int = 2
     member_z: float = 1.96
+    overdispersion: str = "neighbour"
     support: SupportConfig = field(default_factory=SupportConfig)
 
     def as_dict(self) -> dict:

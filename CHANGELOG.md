@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.0.dev3 — unreleased (MF4)
+
+- Overdispersion (MF4): the conditional technical null allows independent
+  unit-level Gamma heterogeneity (variance kappa) around the technical mean.
+  kappa is estimated per taxon from neighbour differences
+  (`microspira.dispersion.neighbour_dispersion`), residuals use the variance
+  N p (1 - p) + kappa mu^2, null draws include Gamma factors, and kappa is
+  re-estimated on every draw. Global and local (max-T) inference share the
+  draws as before. New `run(overdispersion="neighbour")` default and
+  `SPIRAConfig.overdispersion`; `"none"` reproduces 0.1.0.dev2 exactly.
+- New taxon columns: `dispersion_model`, `dispersion_kappa`,
+  `dispersion_lambda` (kappa x mean reads per unit), `dispersion_null_median`.
+- Member units (`member_z`) use the overdispersion-scaled residual.
+- The low-level `residual_spatial_test(overdispersion="none")` default is
+  unchanged, as is its `refit_bootstrap=False` default.
+
 ## 0.1.0.dev2 — 2026-11-02
 
 - Context (MF1): remove the independence-based chi-square p/q and the

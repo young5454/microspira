@@ -195,7 +195,7 @@ class ReplicateBoundaryTests(unittest.TestCase):
 
 class CompatibilityTests(unittest.TestCase):
     def test_version_and_low_level_default(self):
-        self.assertEqual(ms.__version__, "0.1.0.dev2")
+        self.assertEqual(ms.__version__, "0.1.0.dev3")
         self.assertIs(inspect.signature(residual_spatial_test)
                       .parameters["refit_bootstrap"].default, False)
 

@@ -17,6 +17,8 @@ from scipy.special import logsumexp
 
 from .spatial import morans_i
 from .clusters import neighborhood_operator, neighborhood_enrichment
+from .dispersion import (OVERDISPERSION_METHODS, draw_null, graph_edges, neighbour_dispersion,
+                         overdispersed_residual)
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,9 @@ class ResidualSpatialTest:
     neighborhood_reads: np.ndarray | None = None
     neighborhood_expected: np.ndarray | None = None
     failure_reason: str = ""
+    overdispersion: str = "none"
+    dispersion_kappa: float = 0.0
+    dispersion_null_median: float = np.nan
 
 
 def spline_basis(values: np.ndarray, df: int = 3) -> np.ndarray:
@@ -230,19 +235,35 @@ def residual_spatial_test(
     refit_bootstrap: bool = False,
     offset: np.ndarray | None = None,
     localize: bool = False,
+    overdispersion: str = "none",
+    edges: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> ResidualSpatialTest:
     """Test positive residual spatial clustering under a conditional null.
 
     ``refit_bootstrap=True`` is slower but captures mean-model fitting
     uncertainty and should be used for final calibration. The fast mode is
     useful while exploring a dataset and is labelled in the returned object.
+
+    ``overdispersion="neighbour"`` (the ``run()`` default since 0.1.0.dev3) allows
+    independent unit-level Gamma heterogeneity around the technical mean: the
+    dispersion is estimated from neighbour differences, residuals are scaled by
+    the overdispersed variance, null draws include Gamma factors, and the
+    dispersion is re-estimated on every draw. ``"none"`` is the dev2 multinomial
+    null and is this low-level function's default.
     """
     if n_draws < 19:
         raise ValueError("n_draws must be at least 19 for a meaningful bootstrap.")
+    if overdispersion not in OVERDISPERSION_METHODS:
+        raise ValueError(f"overdispersion must be one of {OVERDISPERSION_METHODS}.")
+    estimate = overdispersion == "neighbour"
+    if estimate and edges is None:
+        edges = graph_edges(W)
     generator = rng or np.random.default_rng()
     y = np.asarray(counts, dtype=float).ravel()
     fit = fit_poisson_gam(y, X, offset=offset)
-    residual = conditional_residual(y, fit.mu)
+    fitted_total = _normalise_mu(fit.mu, y.sum())
+    kappa = neighbour_dispersion(y, fitted_total, edges) if (estimate and fit.converged) else 0.0
+    residual = overdispersed_residual(y, fitted_total, kappa) if estimate else conditional_residual(y, fit.mu)
     observed = morans_i(residual, W)
     if not np.isfinite(observed) or not fit.converged:
         return ResidualSpatialTest(
@@ -257,6 +278,8 @@ def residual_spatial_test(
             n_draws=n_draws,
             fit=fit,
             failure_reason="observed_fit_not_converged" if not fit.converged else "observed_statistic_non_finite",
+            overdispersion=overdispersion,
+            dispersion_kappa=kappa,
         )
 
     probability = fit.mu / fit.mu.sum()
@@ -269,18 +292,24 @@ def residual_spatial_test(
     fit_failures = 0
     maximum_iterations = 0
     fit_valid = np.ones(n_draws, dtype=bool)
+    null_kappa = np.zeros(n_draws)
+    total = int(np.rint(y.sum()))
     for b in range(n_draws):
-        draw = generator.multinomial(int(np.rint(y.sum())), probability).astype(float)
+        draw = draw_null(generator, total, probability, kappa)
         if refit_bootstrap:
             null_fit = fit_poisson_gam(draw, X, offset=offset)
             maximum_iterations = max(maximum_iterations, null_fit.n_iter)
             fit_valid[b] = null_fit.converged
             fit_failures += int(not null_fit.converged)
-            null_residual = conditional_residual(draw, null_fit.mu)
             null_mu = null_fit.mu
         else:
-            null_residual = conditional_residual(draw, fit.mu)
             null_mu = fit.mu
+        if estimate:
+            null_total = _normalise_mu(null_mu, draw.sum())
+            null_kappa[b] = neighbour_dispersion(draw, null_total, edges)
+            null_residual = overdispersed_residual(draw, null_total, null_kappa[b])
+        else:
+            null_residual = conditional_residual(draw, null_mu)
         null_i[b] = morans_i(null_residual, W)
         if localize:
             scores, _, _ = neighborhood_enrichment(draw, null_mu, local_operator)
@@ -331,6 +360,9 @@ def residual_spatial_test(
         failure_reason=",".join(reason for condition, reason in (
             (fit_failures > 0, "bootstrap_fit_not_converged"),
             ((~finite).any(), "bootstrap_statistic_non_finite")) if condition),
+        overdispersion=overdispersion,
+        dispersion_kappa=kappa,
+        dispersion_null_median=float(np.median(null_kappa)) if estimate else 0.0,
     )
 
 
